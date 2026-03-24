@@ -1,0 +1,4 @@
+B1. Cấu hình model -> config.py
+B2. Huấn luyện -> train.py
+B3. Thử nghiệm -> test3.py
+B4. Vẽ đồ thị -> draw.py

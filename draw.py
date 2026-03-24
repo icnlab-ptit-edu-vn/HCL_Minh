@@ -283,6 +283,6 @@ def plot_from_npz(npz_path, out_dir=None, show_plot=False):
 
 # ---------------- CLI ----------------
 if __name__ == "__main__":
-    npz_file = "results/results_3methods_3000_20251023_223954.npz"
-    out_dir = "results/results_3methods_3000_20251023_223954"
+    npz_file = "results/results_3methods_3000_20251215_054944.npz"
+    out_dir = "results/results_3methods_3000_20251215_054944"
     plot_from_npz(npz_file, out_dir=out_dir, show_plot=False)

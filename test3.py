@@ -1,428 +1,298 @@
 #!/usr/bin/env python3
-"""
-test3.py
-So sánh 3 phương pháp: RL-HCR, PEG-ABC, LEACH-C
-Phiên bản ổn định (robust padding, safe mean/std, debug).
-"""
-
 from datetime import datetime
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 import torch
+from tqdm import tqdm
 
-# Project imports (adjust paths if necessary)
+from config import *
 from env.wsn_env import WSNEnvironment
 from rl.hppo import H_PPO
-from config import *
 
-# If your protocols modules live elsewhere, adjust import paths
-from protocols.peg_abc import select_leaders_peg_abc
-# LEACH-C helpers are used inside env.setup_leach_c
+NUM_RUNS = EVAL_NUM_RUNS
+NUM_ROUNDS = EVAL_NUM_ROUNDS
 
-# ---------------- Configuration ----------------
-NUM_RUNS = 10        # số runs độc lập để lấy trung bình / std
-NUM_ROUNDS = 20    # số vòng tối đa cho mỗi run
-NUM_CLUSTERS = NUM_CLUSTERS if 'NUM_CLUSTERS' in globals() else 6
-SAVE_PLOT = "results_comparison_3methods_full_3000.png"
 
-# ---------------- Utility functions ----------------
+def build_env():
+    return WSNEnvironment(
+        n_nodes=N_NODES,
+        area=AREA_SIZE,
+        bs=BS_POS,
+        initial_energy=INITIAL_ENERGY,
+        control_uplink_bits=CONTROL_UPLINK_BITS,
+        control_downlink_bits=CONTROL_DOWNLINK_BITS,
+        max_cluster_hint=MAX_CLUSTERS,
+        reward_alpha=REWARD_ALPHA,
+        reward_beta=REWARD_BETA,
+        reward_gamma=REWARD_GAMMA,
+        reward_delta=REWARD_DELTA,
+    )
 
-# def compute_jain(energy_array):
-#     if energy_array is None or len(energy_array) == 0:
-#         return np.nan  # thay vì 0.0 để không làm tăng fairness giả
-#     s = np.sum(energy_array)
-#     denom = len(energy_array) * np.sum(energy_array ** 2)
-#     return (s ** 2) / denom if denom > 0 else np.nan
 
-def compute_jain(energy_array):
-    """
-    Trả về Jain's fairness index. Nếu không có node sống hoặc chỉ 1 node sống -> trả np.nan
-    để tránh spike giả tạo khi chỉ còn 1 sample.
-    """
-    if energy_array is None:
-        return np.nan
-    # Lọc những giá trị hợp lệ
-    a = np.asarray(energy_array)
-    if a.size <= 1:
-        return np.nan
-    # Nếu có NaN trong a, loại bỏ chúng
+def build_agent(device):
+    return H_PPO(
+        state_dim=RL_STATE_DIM,
+        action_dim_discrete=DISCRETE_ACTION_DIM,
+        gamma=GAMMA,
+        device=device,
+    )
+
+
+def load_checkpoint_if_available(agent):
+    candidates = [
+        os.path.join(MODEL_DIR, "minhht2026_best.pth"),
+        os.path.join(MODEL_DIR, f"minhht2026_ep{EPISODES}.pth"),
+        os.path.join(MODEL_DIR, "rl_hcr_best.pth"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                agent.load(path)
+                return path
+            except Exception:
+                pass
+    return None
+
+
+def compute_jain(values):
+    a = np.asarray(values, dtype=np.float32)
     a = a[~np.isnan(a)]
     if a.size <= 1:
         return np.nan
-    s = np.sum(a)
     denom = a.size * np.sum(a ** 2)
     if denom <= 0:
         return np.nan
-    return (s ** 2) / denom
+    return float((np.sum(a) ** 2) / denom)
 
 
-
-def pad_with_nan(list_of_lists):
-    """
-    Pad list of lists/arrays with np.nan to same length.
-    Returns (padded_array (n_runs, max_len), max_len)
-    """
-    if len(list_of_lists) == 0:
-        return np.zeros((0, 0)), 0
-    lengths = [len(x) for x in list_of_lists]
-    max_len = max(lengths) if lengths else 0
-    padded = np.full((len(list_of_lists), max_len), np.nan, dtype=float)
-    for i, arr in enumerate(list_of_lists):
-        if arr is None:
-            continue
-        a = np.array(arr, dtype=float)
-        padded[i, :len(a)] = a
-    return padded, max_len
-
-def ensure_global_len(padded, current_max, global_max):
-    """Extend padded to global_max columns by appending np.nan columns."""
-    if current_max == global_max:
-        return padded
-    if padded.size == 0:
-        return np.full((0, global_max), np.nan)
-    extra = np.full((padded.shape[0], global_max - current_max), np.nan, dtype=float)
-    return np.concatenate([padded, extra], axis=1)
-
-def safe_nanmean_std(padded):
-    """
-    Compute mean and std safely from padded (with np.nan).
-    Replace columns where all values are nan with zeros (mean=0,std=0).
-    """
-    if padded.size == 0:
-        return np.array([]), np.array([])
-    mean = np.nanmean(padded, axis=0)
-    std = np.nanstd(padded, axis=0)
-    nan_cols = np.isnan(mean)
-    if np.any(nan_cols):
-        mean[nan_cols] = 0.0
-        std[nan_cols] = 0.0
-    return mean, std
-
-# ---------------- Run functions ----------------
-def run_one_rl(env, agent, deterministic=True, max_rounds=NUM_ROUNDS, initial_clusters=NUM_CLUSTERS):
-    """Run RL-HCR on env using agent (agent may be untrained)."""
-    agent.set_eval_mode()
-    env.reset()
-    env.cluster_and_build_chains(num_clusters=initial_clusters)
-
+def milestones_from_alive(alive_history, initial_nodes):
     fnd = hnd = lnd = None
-    alive_history = []
-    energy_history = []
-    fairness_history = []
-    cluster_history = []
-    phi_history = []
-    total_packets = 0
-    total_energy = 0.0
-
-    round_idx = 0
-    initial_nodes = env.n
-
-    while round_idx < max_rounds:
-        state = env.get_slim_state()
-        delta, phi, _, _ = agent.select_action(state, deterministic=deterministic)
-
-        try:
-            num_clusters = int(delta) + 3
-        except Exception:
-            num_clusters = initial_clusters
-
-        if num_clusters != len(env.clusters):
-            env.cluster_and_build_chains(num_clusters=num_clusters)
-
-        reward, done, info = env.transmit_data(phi=phi)
-
-        alive_count = int(info.get("alive_count", -1))
-        if alive_count < 0:
-            alive_count = int(info.get("alive_ratio", 0.0) * initial_nodes)
-
-        alive_history.append(alive_count)
-        energy_history.append(info.get("energy_consumption", 0.0))
-        total_packets += info.get("packets", 0)
-        total_energy += info.get("energy_consumption", 0.0)
-        cluster_history.append(num_clusters)
-        phi_history.append(phi)
-
-        # cv = info.get("cv", 0.0)
-        # fairness = 1.0 / (1.0 + cv * cv)
-
-        alive_energy = env.energy[env.alive]
-        fairness = compute_jain(alive_energy)
-
-        fairness_history.append(fairness)
-
+    for idx, alive_count in enumerate(alive_history):
         if fnd is None and alive_count < initial_nodes:
-            fnd = round_idx
-        if hnd is None and alive_count <= initial_nodes * 0.5:
-            hnd = round_idx
-        if lnd is None and alive_count <= initial_nodes * 0.3:
-            lnd = round_idx
-
-        round_idx += 1
-
-        if np.sum(env.alive) == 0:
-            break
-        if done and np.sum(env.alive) == 0:
-            break
-
-    if fnd is None: fnd = round_idx
-    if hnd is None: hnd = round_idx
-    if lnd is None: lnd = round_idx
-
+            fnd = idx + 1
+        if hnd is None and alive_count <= 0.5 * initial_nodes:
+            hnd = idx + 1
+        if lnd is None and alive_count == 0:
+            lnd = idx + 1
+    length = len(alive_history)
     return {
-        "fnd": fnd, "hnd": hnd, "lnd": lnd,
+        "fnd": length if fnd is None else fnd,
+        "hnd": length if hnd is None else hnd,
+        "lnd": length if lnd is None else lnd,
+    }
+
+
+def finalize_result(env, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history):
+    milestones = milestones_from_alive(alive_history, env.n)
+    total_energy = np.asarray(data_energy_history, dtype=np.float32) + np.asarray(control_energy_history, dtype=np.float32)
+    return {
+        **milestones,
         "alive_history": alive_history,
-        "energy_history": energy_history,
+        "data_energy_history": data_energy_history,
+        "control_energy_history": control_energy_history,
         "fairness_history": fairness_history,
         "cluster_history": cluster_history,
-        "phi_history": phi_history,
-        "total_packets": total_packets,
-        "total_energy": total_energy,
-        "rounds": round_idx
+        "total_data_energy": float(np.nansum(data_energy_history)),
+        "total_control_energy": float(np.nansum(control_energy_history)),
+        "total_energy": float(np.nansum(total_energy)),
+        "recluster_count": int(np.sum(np.asarray(control_energy_history) > 0.0)),
+        "rounds": len(alive_history),
     }
 
-def run_one_peg_abc(env, num_clusters=NUM_CLUSTERS, phi=0.5, max_rounds=NUM_ROUNDS):
-    """Run PEG-ABC baseline by re-clustering each round and calling transmit_data."""
+
+def record_step(env, info, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history):
+    alive_history.append(int(info["alive_count"]))
+    data_energy_history.append(float(info["data_energy_consumption"]))
+    control_energy_history.append(float(info["reconfig_energy_consumption"]))
+    cluster_history.append(int(info.get("current_clusters", env.current_num_clusters)))
+    fairness_history.append(compute_jain(env.energy[env.alive]))
+
+
+def run_one_adaptive(env, agent, deterministic=True, max_rounds=NUM_ROUNDS):
     env.reset()
-    fnd = hnd = lnd = None
-    alive_history = []
-    energy_history = []
-    fairness_history = []
-    total_packets = 0
-    total_energy = 0.0
+    env.cluster_and_build_chains(num_clusters=INITIAL_CLUSTERS, charge_overhead=False)
+    agent.set_eval_mode()
 
-    round_idx = 0
-    initial_nodes = env.n
+    alive_history, data_energy_history, control_energy_history = [], [], []
+    fairness_history, cluster_history = [], []
 
-    while round_idx < max_rounds:
-        env.cluster_and_build_chains(num_clusters=num_clusters)
-        reward, done, info = env.transmit_data(phi=phi)
-
-        alive_count = int(info.get("alive_count", -1))
-        if alive_count < 0:
-            alive_count = int(info.get("alive_ratio", 0.0) * initial_nodes)
-
-        alive_history.append(alive_count)
-        energy_history.append(info.get("energy_consumption", 0.0))
-        total_packets += info.get("packets", 0)
-        total_energy += info.get("energy_consumption", 0.0)
-
-        # cv = info.get("cv", 0.0)
-        # fairness = 1.0 / (1.0 + cv * cv)
-        
-        alive_energy = env.energy[env.alive]
-        fairness = compute_jain(alive_energy)
-
-        fairness_history.append(fairness)
-
-        if fnd is None and alive_count < initial_nodes:
-            fnd = round_idx
-        if hnd is None and alive_count <= initial_nodes * 0.5:
-            hnd = round_idx
-        if lnd is None and alive_count <= initial_nodes * 0.3:
-            lnd = round_idx
-
-        round_idx += 1
-        if np.sum(env.alive) == 0:
-            break
-        if done and np.sum(env.alive) == 0:
+    for _ in range(max_rounds):
+        state = env.get_slim_state()
+        topology_action, _ = agent.select_action(state, deterministic=deterministic)
+        _, _, done, info = env.step(
+            topology_action=topology_action,
+            min_clusters=MIN_CLUSTERS,
+            max_clusters=MAX_CLUSTERS,
+            default_clusters=INITIAL_CLUSTERS,
+        )
+        record_step(env, info, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history)
+        if done:
             break
 
-    if fnd is None: fnd = round_idx
-    if hnd is None: hnd = round_idx
-    if lnd is None: lnd = round_idx
+    return finalize_result(env, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history)
 
-    return {
-        "fnd": fnd, "hnd": hnd, "lnd": lnd,
-        "alive_history": alive_history,
-        "energy_history": energy_history,
-        "fairness_history": fairness_history,
-        "total_packets": total_packets,
-        "total_energy": total_energy,
-        "rounds": round_idx
-    }
 
-def run_one_leach_c(env, num_clusters=NUM_CLUSTERS, max_rounds=NUM_ROUNDS):
-    """Run LEACH-C baseline using env.setup_leach_c and env.transmit_data_leach_c."""
+def run_rule_baseline(env, refresh_interval, max_rounds=NUM_ROUNDS):
     env.reset()
-    # ensure env tracks previous cumulative energy for fallback
-    if not hasattr(env, "_prev_total_energy_consumed"):
-        env._prev_total_energy_consumed = 0.0
+    env.cluster_and_build_chains(num_clusters=INITIAL_CLUSTERS, charge_overhead=False)
 
-    fnd = hnd = lnd = None
-    alive_history = []
-    energy_history = []
-    fairness_history = []
-    total_packets = 0
-    total_energy = 0.0
+    alive_history, data_energy_history, control_energy_history = [], [], []
+    fairness_history, cluster_history = [], []
 
-    round_idx = 0
-    initial_nodes = env.n
+    for round_idx in range(max_rounds):
+        if refresh_interval is not None and round_idx > 0 and round_idx % refresh_interval == 0:
+            env.cluster_and_build_chains(num_clusters=INITIAL_CLUSTERS, charge_overhead=True)
+            env.last_recluster_flag = 1.0
+        else:
+            env.last_recluster_overhead = 0.0
+            env.last_control_energy = 0.0
+            env.last_recluster_flag = 0.0
 
-    while round_idx < max_rounds:
-        env.setup_leach_c(num_clusters=num_clusters)
-        reward, done, info = env.transmit_data_leach_c()
-
-        alive_count = int(info.get("alive_count", -1))
-        if alive_count < 0:
-            alive_count = int(info.get("alive_ratio", 0.0) * initial_nodes)
-
-        alive_history.append(alive_count)
-
-        # Try to get energy_consumption from info; fallback to env.total_energy_consumed delta
-        e_cons = info.get("energy_consumption", None)
-        if e_cons is None:
-            current_total = getattr(env, "total_energy_consumed", None)
-            if current_total is None:
-                e_cons = 0.0
-            else:
-                prev_total = getattr(env, "_prev_total_energy_consumed", 0.0)
-                e_cons = current_total - prev_total
-                env._prev_total_energy_consumed = current_total
-                if e_cons < 0:
-                    e_cons = 0.0
-
-        energy_history.append(e_cons)
-        total_packets += info.get("packets", 0)
-        total_energy += e_cons
-
-        alive_energy = env.energy[env.alive]
-        jain = compute_jain(alive_energy)
-        fairness_history.append(jain)
-
-        if fnd is None and alive_count < initial_nodes:
-            fnd = round_idx
-        if hnd is None and alive_count <= initial_nodes * 0.5:
-            hnd = round_idx
-        if lnd is None and alive_count <= initial_nodes * 0.3:
-            lnd = round_idx
-
-        round_idx += 1
-        if np.sum(env.alive) == 0:
-            break
-        if done and np.sum(env.alive) == 0:
+        _, done, info = env.transmit_data()
+        if info.get("reconfig_energy_consumption", 0.0) <= 0.0:
+            env.topology_age += 1
+            env._update_topology_descriptors()
+        record_step(env, {**info, "current_clusters": env.current_num_clusters}, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history)
+        if done:
             break
 
-    if fnd is None: fnd = round_idx
-    if hnd is None: hnd = round_idx
-    if lnd is None: lnd = round_idx
+    return finalize_result(env, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history)
 
-    return {
-        "fnd": fnd, "hnd": hnd, "lnd": lnd,
-        "alive_history": alive_history,
-        "energy_history": energy_history,
-        "fairness_history": fairness_history,
-        "total_packets": total_packets,
-        "total_energy": total_energy,
-        "rounds": round_idx
-    }
 
-# ---------------- Main experiment ----------------
+def pad_with_nan(histories):
+    max_len = max(len(h) for h in histories)
+    arr = np.full((len(histories), max_len), np.nan, dtype=np.float32)
+    for i, history in enumerate(histories):
+        arr[i, : len(history)] = np.asarray(history, dtype=np.float32)
+    return arr
+
+
+def summarize(results):
+    summary = {}
+    for method, runs in results.items():
+        summary[method] = {
+            "fnd_mean": float(np.mean([r["fnd"] for r in runs])),
+            "hnd_mean": float(np.mean([r["hnd"] for r in runs])),
+            "lnd_mean": float(np.mean([r["lnd"] for r in runs])),
+            "data_energy_mean": float(np.mean([r["total_data_energy"] for r in runs])),
+            "control_energy_mean": float(np.mean([r["total_control_energy"] for r in runs])),
+            "total_energy_mean": float(np.mean([r["total_energy"] for r in runs])),
+            "recluster_count_mean": float(np.mean([r["recluster_count"] for r in runs])),
+            "rounds_mean": float(np.mean([r["rounds"] for r in runs])),
+        }
+    return summary
+
+
+def plot_results(results, output_dir):
+    methods = list(results.keys())
+    alive_curves = {m: pad_with_nan([r["alive_history"] for r in runs]) for m, runs in results.items()}
+    fairness_curves = {m: pad_with_nan([r["fairness_history"] for r in runs]) for m, runs in results.items()}
+    data_curves = {m: pad_with_nan([r["data_energy_history"] for r in runs]) for m, runs in results.items()}
+    control_curves = {m: pad_with_nan([r["control_energy_history"] for r in runs]) for m, runs in results.items()}
+
+    plt.figure(figsize=(12, 8))
+    for method in methods:
+        arr = alive_curves[method]
+        x = np.arange(arr.shape[1])
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        plt.plot(x, mean, label=method)
+        plt.fill_between(x, mean - std, mean + std, alpha=0.2)
+    plt.xlabel("Round")
+    plt.ylabel("Alive nodes")
+    plt.title("Alive-node trajectory")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "alive_nodes.png"), dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(12, 8))
+    for method in methods:
+        arr = fairness_curves[method]
+        x = np.arange(arr.shape[1])
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        plt.plot(x, mean, label=method)
+        plt.fill_between(x, mean - std, mean + std, alpha=0.2)
+    plt.xlabel("Round")
+    plt.ylabel("Jain fairness")
+    plt.title("Residual-energy fairness")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fairness.png"), dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(12, 8))
+    for method in methods:
+        arr = data_curves[method]
+        x = np.arange(arr.shape[1])
+        plt.plot(x, np.nancumsum(np.nanmean(arr, axis=0)), label=method)
+    plt.xlabel("Round")
+    plt.ylabel("Cumulative data energy (J)")
+    plt.title("Data-communication energy accumulation")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "data_energy.png"), dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(12, 8))
+    for method in methods:
+        arr = control_curves[method]
+        x = np.arange(arr.shape[1])
+        plt.plot(x, np.nancumsum(np.nanmean(arr, axis=0)), label=method)
+    plt.xlabel("Round")
+    plt.ylabel("Cumulative control energy (J)")
+    plt.title("Reconfiguration-overhead accumulation")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "control_energy.png"), dpi=200)
+    plt.close()
+
+
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    print(f"DEVICE = {device}")
-    print("Model dir:", MODEL_DIR)
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    agent = build_agent(device)
+    checkpoint = load_checkpoint_if_available(agent)
+    if checkpoint:
+        print(f"Loaded checkpoint: {checkpoint}")
 
-    agent = H_PPO(state_dim=10, device=device)
+    methods = {"ADAPTIVE": [], "STATIC": [], "PERIODIC": [], "ALWAYS_REFRESH": []}
+    for _ in tqdm(range(NUM_RUNS), desc="Evaluation runs"):
+        methods["ADAPTIVE"].append(run_one_adaptive(build_env(), agent, deterministic=True))
+        methods["STATIC"].append(run_rule_baseline(build_env(), refresh_interval=None))
+        methods["PERIODIC"].append(run_rule_baseline(build_env(), refresh_interval=PERIODIC_REFRESH_INTERVAL))
+        methods["ALWAYS_REFRESH"].append(run_rule_baseline(build_env(), refresh_interval=1))
 
-    model_paths = [
-        os.path.join(MODEL_DIR, "rl_hcr_best.pth"),
-        os.path.join(MODEL_DIR, f"rl_hcr_ep{EPISODES}.pth")
-    ]
-    model_loaded = False
-    for mp in model_paths:
-        if os.path.exists(mp):
-            try:
-                agent.load(mp)
-                print(f"✅ Loaded RL model: {mp}")
-                model_loaded = True
-                break
-            except Exception as e:
-                print(f"⚠️ Warning: failed to load {mp}: {e}")
-
-    if not model_loaded:
-        print("⚠️ No RL checkpoint found; RL will use random/untrained policy.")
-
-    # Kết quả
-    rl_results = {"fnd": [], "hnd": [], "lnd": [], "alive": [], "energy": [], "fairness": []}
-    peg_results = {"fnd": [], "hnd": [], "lnd": [], "alive": [], "energy": [], "fairness": []}
-    leach_results = {"fnd": [], "hnd": [], "lnd": [], "alive": [], "energy": [], "fairness": []}
-
-    print(f"Running {NUM_RUNS} runs (each up to {NUM_ROUNDS} rounds)...")
-    for run in tqdm(range(NUM_RUNS), desc="Experiments"):
-        env_rl = WSNEnvironment(n_nodes=N_NODES, area=AREA_SIZE, bs=BS_POS)
-        res_rl = run_one_rl(env_rl, agent, deterministic=True, max_rounds=NUM_ROUNDS, initial_clusters=NUM_CLUSTERS)
-        for k in rl_results.keys():
-            rl_results[k].append(res_rl[k if k in res_rl else k+"_history"])
-
-        env_peg = WSNEnvironment(n_nodes=N_NODES, area=AREA_SIZE, bs=BS_POS)
-        res_peg = run_one_peg_abc(env_peg, num_clusters=NUM_CLUSTERS, phi=0.5, max_rounds=NUM_ROUNDS)
-        for k in peg_results.keys():
-            peg_results[k].append(res_peg[k if k in res_peg else k+"_history"])
-
-        env_leach = WSNEnvironment(n_nodes=N_NODES, area=AREA_SIZE, bs=BS_POS)
-        res_leach = run_one_leach_c(env_leach, num_clusters=NUM_CLUSTERS, max_rounds=NUM_ROUNDS)
-        for k in leach_results.keys():
-            leach_results[k].append(res_leach[k if k in res_leach else k+"_history"])
-
-        print(f"Run {run+1}/{NUM_RUNS} done: RL={len(res_rl['alive_history'])}, PEG={len(res_peg['alive_history'])}, LEACH={len(res_leach['alive_history'])}")
-
-    # --- Chuẩn bị padding và trung bình ---
-    rl_alive_padded, rl_max = pad_with_nan(rl_results["alive"])
-    peg_alive_padded, peg_max = pad_with_nan(peg_results["alive"])
-    leach_alive_padded, leach_max = pad_with_nan(leach_results["alive"])
-    global_max = max(rl_max, peg_max, leach_max)
-    rl_alive_padded = ensure_global_len(rl_alive_padded, rl_max, global_max)
-    peg_alive_padded = ensure_global_len(peg_alive_padded, peg_max, global_max)
-    leach_alive_padded = ensure_global_len(leach_alive_padded, leach_max, global_max)
-
-    rl_energy_padded, rl_e_max = pad_with_nan(rl_results["energy"])
-    peg_energy_padded, peg_e_max = pad_with_nan(peg_results["energy"])
-    leach_energy_padded, leach_e_max = pad_with_nan(leach_results["energy"])
-    rl_energy_padded = ensure_global_len(rl_energy_padded, rl_e_max, global_max)
-    peg_energy_padded = ensure_global_len(peg_energy_padded, peg_e_max, global_max)
-    leach_energy_padded = ensure_global_len(leach_energy_padded, leach_e_max, global_max)
-
-    rl_f_padded, _ = pad_with_nan(rl_results["fairness"])
-    peg_f_padded, _ = pad_with_nan(peg_results["fairness"])
-    leach_f_padded, _ = pad_with_nan(leach_results["fairness"])
-    rl_f_padded = ensure_global_len(rl_f_padded, rl_f_padded.shape[1] if rl_f_padded.size else 0, global_max)
-    peg_f_padded = ensure_global_len(peg_f_padded, peg_f_padded.shape[1] if peg_f_padded.size else 0, global_max)
-    leach_f_padded = ensure_global_len(leach_f_padded, leach_f_padded.shape[1] if leach_f_padded.size else 0, global_max)
-
-    # --- Lưu toàn bộ dữ liệu ra file .npz ---
-    os.makedirs("results", exist_ok=True)
+    summary = summarize(methods)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = f"results/results_3methods_3000_{timestamp}.npz"
-
-    np.savez_compressed(
-        save_path,
-        rl_fnd=rl_results["fnd"],
-        rl_hnd=rl_results["hnd"],
-        rl_lnd=rl_results["lnd"],
-        peg_fnd=peg_results["fnd"],
-        peg_hnd=peg_results["hnd"],
-        peg_lnd=peg_results["lnd"],
-        leach_fnd=leach_results["fnd"],
-        leach_hnd=leach_results["hnd"],
-        leach_lnd=leach_results["lnd"],
-        rl_alive=rl_alive_padded,
-        peg_alive=peg_alive_padded,
-        leach_alive=leach_alive_padded,
-        rl_energy=rl_energy_padded,
-        peg_energy=peg_energy_padded,
-        leach_energy=leach_energy_padded,
-        rl_fairness=rl_f_padded,
-        peg_fairness=peg_f_padded,
-        leach_fairness=leach_f_padded,
+    output_dir = os.path.join(RESULTS_DIR, f"minhht2026_eval_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    np.savez(
+        os.path.join(output_dir, "results.npz"),
+        raw_results=methods,
+        summary=summary,
+        config={
+            "num_runs": NUM_RUNS,
+            "num_rounds": NUM_ROUNDS,
+            "periodic_refresh_interval": PERIODIC_REFRESH_INTERVAL,
+            "min_clusters": MIN_CLUSTERS,
+            "max_clusters": MAX_CLUSTERS,
+            "initial_clusters": INITIAL_CLUSTERS,
+        },
     )
 
-    print(f"✅ Saved all raw data for plotting to: {save_path}")
+    plot_results(methods, output_dir)
 
-    # --- Giữ nguyên phần vẽ biểu đồ ---
-    # (phần plotting như trong code của bạn, không cần thay đổi)
-    # Sau khi chạy xong bạn có thể vẽ lại từ file .npz mà không cần chạy lại mô phỏng.
+    print("\n=== Summary ===")
+    for method, stats in summary.items():
+        print(
+            f"{method:15s} | FND {stats['fnd_mean']:.1f} | HND {stats['hnd_mean']:.1f} | "
+            f"LND {stats['lnd_mean']:.1f} | DataE {stats['data_energy_mean']:.4f} | "
+            f"CtrlE {stats['control_energy_mean']:.4f} | ReclusterCnt {stats['recluster_count_mean']:.1f}"
+        )
+    print(f"\nSaved outputs to: {output_dir}")
+
 
 if __name__ == "__main__":
     main()
