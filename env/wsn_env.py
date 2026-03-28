@@ -251,10 +251,10 @@ class WSNEnvironment:
             self.last_control_energy = 0.0
 
         self.last_recluster_flag = float(reconfigure)
-        reward, done, info = self.transmit_data()
         if not reconfigure:
             self.topology_age += 1
-            self._update_topology_descriptors()
+        reward, done, info = self.transmit_data()
+        self._update_topology_descriptors()
 
         info.update(
             {
@@ -350,7 +350,7 @@ class WSNEnvironment:
                 "jain": 0.0,
             }
 
-        round_energy = self.pending_reconfig_overhead.copy()
+        round_energy = np.zeros(self.n, dtype=np.float32)
         packets_sent = 0
 
         for chain in self.chains:
