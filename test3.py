@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 from datetime import datetime
 import os
 import numpy as np
@@ -141,18 +141,20 @@ def run_rule_baseline(env, refresh_interval, max_rounds=NUM_ROUNDS):
     fairness_history, cluster_history = [], []
 
     for round_idx in range(max_rounds):
-        if refresh_interval is not None and round_idx > 0 and round_idx % refresh_interval == 0:
+        reconfigured = False
+        if refresh_interval is not None and round_idx % refresh_interval == 0:
             env.cluster_and_build_chains(num_clusters=INITIAL_CLUSTERS, charge_overhead=True)
             env.last_recluster_flag = 1.0
+            reconfigured = True
         else:
             env.last_recluster_overhead = 0.0
             env.last_control_energy = 0.0
             env.last_recluster_flag = 0.0
 
-        _, done, info = env.transmit_data()
-        if info.get("reconfig_energy_consumption", 0.0) <= 0.0:
+        if not reconfigured:
             env.topology_age += 1
-            env._update_topology_descriptors()
+        _, done, info = env.transmit_data()
+        env._update_topology_descriptors()
         record_step(env, {**info, "current_clusters": env.current_num_clusters}, alive_history, data_energy_history, control_energy_history, fairness_history, cluster_history)
         if done:
             break
